@@ -6,6 +6,7 @@
 
 - 本地 SQLite 消息库内置 510 条内容：无畏契约回怼、不带脏字、笑话、脑筋急转弯、聊天接梗、夸夸和日常用语。
 - 在脚本中新增、编辑消息和分类，为消息设置场景。
+- 键盘可切换到 Rime 中文输入模式，支持拼音组合、候选词上屏和中英文切换。
 - 点分类或场景胶囊立即填入随机消息；能确认上句位置时直接替换，否则保留原文并在当前光标/选区插入。一轮内避免重复。
 - 脑筋急转弯的题目和答案分别查看、分别填入。
 
@@ -15,7 +16,7 @@
 2. 在 iOS「设置 → 通用 → 键盘 → 键盘 → 添加新键盘」中启用 Scripting。
 3. 在聊天输入框切换到 Scripting 键盘并选择本脚本，点分类或场景胶囊填入随机消息；键盘不会自动发送。
 
-分类和消息的修改在重新打开键盘后生效。自定义键盘为 Scripting Pro 功能，详见[官方说明](https://scriptingapp.github.io/zh/guide/Custom%20Keyboard)。
+分类和消息的修改在重新打开键盘后生效。自定义键盘和 Rime 均需 Scripting Pro；Rime 还需先导入并部署输入方案。详见[自定义键盘说明](https://scriptingapp.github.io/zh/guide/Custom%20Keyboard)和[Rime 输入法说明](https://scriptingapp.github.io/zh/guide/Rime)。
 
 ## 数据与隐私
 

@@ -1,11 +1,14 @@
 import { Button, HStack, ScrollView, Spacer, Text, VStack, modifiers, useState } from "scripting"
 import { canReplaceInsertedMessage, drawNextMessage } from "./quick-messages.js"
+import { createRimeKeyboard, RIME_KEY } from "./rime-keyboard.js"
+import type { RimeKeyboard, RimeSnapshot } from "./rime-keyboard.js"
 import { openLocalMessageStore } from "./message-store.js"
 import type { DatabasePage, MessageStore } from "./message-store.js"
 import type { QuickMessage } from "./quick-messages.js"
 
 type InsertedMessage = { message: QuickMessage; before: string | null; after: string | null; allText: string | null }
 type SceneOption = { id: string; title: string; count: number }
+type KeyboardMode = "quick" | "chinese"
 
 let activeQuery = 0
 const capsulePalette = ["#005FCC", "#5E35B1", "#AD1457", "#00695C", "#C2410C", "#37474F", "#3949AB"]
@@ -39,7 +42,51 @@ function graphemes(value: string) {
   return Array.from(new Segmenter(undefined, { granularity: "grapheme" }).segment(value), (part: { segment: string }) => part.segment)
 }
 
+function RimeInputPanel({ controller, snapshot, status, onSnapshot }: {
+  controller: RimeKeyboard | null
+  snapshot: RimeSnapshot | null
+  status: string
+  onSnapshot: (next: RimeSnapshot) => void
+}) {
+  function press(keyCode: number) {
+    if (!controller) return
+    try { onSnapshot(controller.pressKey(keyCode)) } catch { /* The parent reports unavailable input state. */ }
+  }
+  const rows = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
+  return <VStack spacing={5}>
+    <ScrollView axes="horizontal" scrollIndicator="hidden" modifiers={modifiers().frame({ height: 38 })}>
+      <HStack spacing={5}>
+        {snapshot?.candidates.length ? snapshot.candidates.map((candidate, index) => <Button key={`${index}:${candidate}`} title={candidate} buttonStyle="plain" disabled={!controller} action={() => {
+          if (!controller) return
+          try { onSnapshot(controller.selectCandidate(index)) } catch { /* Keep the keyboard responsive if Rime rejects a candidate. */ }
+        }} modifiers={modifiers().frame({ minWidth: 38, minHeight: 34 })} />)
+          : <Text modifiers={modifiers().font(13).foregroundStyle("secondaryLabel")}>{snapshot?.preedit || status || snapshot?.schemaName || "中文输入"}</Text>}
+      </HStack>
+    </ScrollView>
+    {rows.map((row, rowIndex) => <HStack key={row} spacing={4}>
+      {rowIndex === 1 ? <Spacer /> : null}
+      {Array.from(row).map((letter) => <Button key={letter} title={letter} buttonStyle="bordered" disabled={!controller} action={() => press(letter.charCodeAt(0))} modifiers={modifiers().frame({ minWidth: rowIndex === 2 ? 37 : 32, minHeight: 36 })} />)}
+      {rowIndex === 1 ? <Spacer /> : null}
+      {rowIndex === 2 ? <Button title="⌫" buttonStyle="bordered" disabled={!controller} action={() => press(RIME_KEY.backspace)} modifiers={modifiers().frame({ minWidth: 48, minHeight: 36 })} /> : null}
+    </HStack>)}
+    <HStack spacing={5}>
+      <Button title={snapshot?.asciiMode ? "中文" : "英数"} buttonStyle="bordered" disabled={!controller} action={() => {
+        if (!controller) return
+        try { onSnapshot(controller.toggleAscii()) } catch { /* Keep the keyboard responsive if Rime rejects an option change. */ }
+      }} modifiers={modifiers().frame({ minWidth: 56, minHeight: 38 })} />
+      <Button title="," buttonStyle="bordered" disabled={!controller} action={() => press(",".charCodeAt(0))} modifiers={modifiers().frame({ minWidth: 38, minHeight: 38 })} />
+      <Button title="空格" buttonStyle="bordered" disabled={!controller} action={() => press(RIME_KEY.space)} modifiers={modifiers().frame({ maxWidth: "infinity", minHeight: 38 })} />
+      <Button title="。" buttonStyle="bordered" disabled={!controller} action={() => press(".".charCodeAt(0))} modifiers={modifiers().frame({ minWidth: 38, minHeight: 38 })} />
+      <Button title="↵" buttonStyle="borderedProminent" disabled={!controller} action={() => press(RIME_KEY.enter)} modifiers={modifiers().frame({ minWidth: 44, minHeight: 38 })} />
+    </HStack>
+  </VStack>
+}
+
 function QuickMessageKeyboard({ store, initialPage, initialScenes }: { store: MessageStore; initialPage: DatabasePage; initialScenes: SceneOption[] }) {
+  const [mode, setMode] = useState<KeyboardMode>("quick")
+  const [rimeController, setRimeController] = useState<RimeKeyboard | null>(null)
+  const [rimeSnapshot, setRimeSnapshot] = useState<RimeSnapshot | null>(null)
+  const [rimeStatus, setRimeStatus] = useState("")
   const [categoryId, setCategoryId] = useState(initialPage.categoryId)
   const [scenes, setScenes] = useState<SceneOption[]>(initialScenes)
   const [activeSceneId, setActiveSceneId] = useState("all")
@@ -50,6 +97,46 @@ function QuickMessageKeyboard({ store, initialPage, initialScenes }: { store: Me
   const [currentMessage, setCurrentMessage] = useState<QuickMessage | null>(null)
   const [showAnswer, setShowAnswer] = useState(false)
   const [drawBags, setDrawBags] = useState<Record<string, { remaining: string[]; lastId: string }>>({})
+
+  async function enterChineseMode() {
+    setMode("chinese")
+    CustomKeyboard.requestHeight(300)
+    if (rimeController) {
+      setRimeStatus("")
+      return
+    }
+    setRimeStatus("正在加载 Rime…")
+    try {
+      if (typeof Rime === "undefined") throw new Error("当前 Scripting 版本未提供 Rime 输入引擎")
+      const controller = await createRimeKeyboard(Rime, CustomKeyboard)
+      setRimeController(controller)
+      setRimeSnapshot(controller.snapshot())
+      setRimeStatus("")
+    } catch (error) {
+      const message = error && typeof error === "object" && "message" in error ? String((error as { message: unknown }).message) : "Rime 初始化失败；请检查方案后重试"
+      setRimeStatus(message)
+    }
+  }
+
+  function enterQuickMode() {
+    if (rimeController) {
+      try { rimeController.commitComposition() } catch { setNotice("未能提交拼音组合文本") }
+      rimeController.close()
+      setRimeController(null)
+      setRimeSnapshot(null)
+    }
+    setRimeStatus("")
+    setMode("quick")
+    CustomKeyboard.requestHeight(216)
+  }
+
+  function finishKeyboard() {
+    if (rimeController) {
+      try { rimeController.commitComposition() } catch { /* The host may no longer expose an active text field. */ }
+      rimeController.close()
+    }
+    CustomKeyboard.dismiss()
+  }
   function fillAtCursor(item: QuickMessage, successNotice = "已填入 · 发送前可修改") {
     try {
       CustomKeyboard.insertText(item.text)
@@ -150,6 +237,9 @@ function QuickMessageKeyboard({ store, initialPage, initialScenes }: { store: Me
       setNotice("请先取消文字选区再清空")
       return
     }
+    if (rimeController) {
+      try { rimeController.clearComposition(); setRimeSnapshot(rimeController.snapshot()) } catch { /* Continue clearing the host draft. */ }
+    }
     const units = graphemes(context.allText)
     const afterUnits = typeof context.after === "string" ? graphemes(context.after)
       : context.after === null && context.allText === context.before ? [] : null
@@ -187,12 +277,14 @@ function QuickMessageKeyboard({ store, initialPage, initialScenes }: { store: Me
   return (
     <VStack alignment="leading" spacing={6} padding={{ horizontal: 10, vertical: 6 }} background="secondarySystemBackground" modifiers={modifiers().frame({ maxWidth: "infinity", maxHeight: "infinity" })}>
       <HStack spacing={8}>
-        <Text modifiers={modifiers().font(15).bold().foregroundStyle("label")}>快捷消息</Text>
+        <Button title="快捷消息" buttonStyle={mode === "quick" ? "borderedProminent" : "plain"} action={enterQuickMode} />
+        <Button title="中文输入" buttonStyle={mode === "chinese" ? "borderedProminent" : "plain"} action={() => { void enterChineseMode() }} />
         <Spacer />
-        <Text modifiers={modifiers().font(11).foregroundStyle("secondaryLabel")}>{loading ? "抽取中…" : notice}</Text>
-        <Button title="完成" buttonStyle="plain" action={() => CustomKeyboard.dismiss()} />
+        <Text modifiers={modifiers().font(11).foregroundStyle("secondaryLabel")}>{mode === "quick" ? (loading ? "抽取中…" : notice) : (rimeSnapshot?.schemaName || rimeStatus || "中文输入")}</Text>
+        <Button title="完成" buttonStyle="plain" action={finishKeyboard} />
       </HStack>
 
+      {mode === "chinese" ? <RimeInputPanel controller={rimeController} snapshot={rimeSnapshot} status={rimeStatus} onSnapshot={setRimeSnapshot} /> : <VStack spacing={6}>
       <ScrollView axes="horizontal" scrollIndicator="hidden" modifiers={modifiers().frame({ height: 46 })}>
         <HStack spacing={6}>
           {initialPage.categories.map((category) => (
@@ -217,9 +309,10 @@ function QuickMessageKeyboard({ store, initialPage, initialScenes }: { store: Me
         {showAnswer ? <Text modifiers={modifiers().font(14).foregroundStyle("label")}>{currentMessage.answer}</Text> : null}
       </VStack> : null}
 
+      </VStack>}
       <HStack spacing={8}>
-        {previousMessage ? <Button title="上一句" buttonStyle="plain" disabled={loading} action={showPrevious} /> : null}
-        <Button title="清空输入" role="destructive" buttonStyle="plain" disabled={loading} action={clearInput} />
+        {mode === "quick" && previousMessage ? <Button title="上一句" buttonStyle="plain" disabled={loading} action={showPrevious} /> : null}
+        <Button title="清空输入" role="destructive" buttonStyle="plain" disabled={mode === "quick" && loading} action={clearInput} />
         <Spacer />
         <Text modifiers={modifiers().font(11).foregroundStyle("secondaryLabel")}>不自动发送</Text>
       </HStack>

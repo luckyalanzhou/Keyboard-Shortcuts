@@ -13,11 +13,11 @@ afterEach(() => { for (const db of databases) db.close(); databases.clear() })
 const settle = () => new Promise((resolve) => setImmediate(resolve))
 
 // Execute the real TSX handlers with mocked host controls, not source regexes.
-async function launch(file, initial = loadLibrary(null), db = createDatabase()) {
+async function launch(file, initial = loadLibrary(null), db = createDatabase(), rimeEngine = null) {
   databases.add(db)
   const store = await openMessageStore(db, initial)
   const values = new Map([[LIBRARY_STORAGE_KEY, JSON.parse(JSON.stringify(initial))], ["unrelated.setting", { value: "keep" }]])
-  const host = { values, screens: [], inserted: [], clicks: 0, heights: [], presentations: 0, before: "", after: null, selected: null, contextLimit: Infinity, failWrite: false, failInsert: false, failDelete: false, failSound: false, confirm: true, prompt: null }
+  const host = { values, screens: [], inserted: [], clicks: 0, heights: [], presentations: 0, before: "", after: null, selected: null, marked: "", contextLimit: Infinity, failWrite: false, failInsert: false, failDelete: false, failSound: false, confirm: true, prompt: null }
   host.store = store
   host.db = db
   host.modifierCalls = []
@@ -56,12 +56,13 @@ async function launch(file, initial = loadLibrary(null), db = createDatabase()) 
   assert.equal(compiled.diagnostics.filter((item) => item.category === ts.DiagnosticCategory.Error).length, 0)
   const sandbox = {
     exports: {},
-    require(name) { if (name === "scripting") return scripting; if (name === "./message-store.js") return { openLocalMessageStore: async () => store }; if (name === "./quick-messages.js") return require("./quick-messages.js"); throw new Error(`Unexpected import: ${name}`) },
+    require(name) { if (name === "scripting") return scripting; if (name === "./message-store.js") return { openLocalMessageStore: async () => store }; if (name === "./quick-messages.js") return require("./quick-messages.js"); if (name === "./rime-keyboard.js") return require("./rime-keyboard.js"); throw new Error(`Unexpected import: ${name}`) },
     h: (type, props, ...children) => ({ type, props: { ...props, children }, children }),
     Storage: {
       get(key, options) { assert.equal(options?.shared, true); return JSON.parse(JSON.stringify(values.get(key) ?? null)) },
       set(key, value, options) { assert.equal(options?.shared, true); if (host.failWrite) return false; values.set(key, JSON.parse(JSON.stringify(value))); return true },
     },
+    Rime: rimeEngine || createFakeRimeEngine(host),
     CustomKeyboard: {
       requestHeight(height) { host.heights.push(height) },
       present(element) { host.presentations++; screen(element) },
@@ -80,6 +81,8 @@ async function launch(file, initial = loadLibrary(null), db = createDatabase()) 
         }
         host.before += text
       },
+      setMarkedText(text) { host.marked = text },
+      unmarkText() { host.marked = "" },
       deleteBackward() {
         if (host.failDelete) throw new Error("No input")
         host.before = Array.from(host.before).slice(0, -1).join("")
@@ -103,9 +106,40 @@ async function launch(file, initial = loadLibrary(null), db = createDatabase()) 
   return host
 }
 
+function createFakeRimeEngine(host, schemaList = [{ id: "luna_pinyin", name: "朙月拼音" }]) {
+  let currentSchema = null
+  return {
+    async setup() {},
+    async listSchemas() { return schemaList },
+    getCurrentSchema() { return currentSchema },
+    async selectSchema(id) { currentSchema = schemaList.find((schema) => schema.id === id) },
+    Session: class {
+      constructor() { this.input = ""; this.pendingCommit = null; this.ascii = false; this.closed = false; this.currentSchema = currentSchema }
+      get context() { return { preedit: this.input || null, menu: this.input ? { candidates: this.input === "ni" ? [{ text: "你" }, { text: "尼" }] : [{ text: this.input }] } : null } }
+      get commit() { const value = this.pendingCommit; this.pendingCommit = null; return value }
+      getOption() { return this.ascii }
+      setOption(_name, value) { this.ascii = value }
+      processKey(code) {
+        if (code >= 97 && code <= 122) { this.input += String.fromCharCode(code); host.marked = this.input; return true }
+        if (code === 0xff08 && this.input) { this.input = this.input.slice(0, -1); return true }
+        return false
+      }
+      selectCandidateOnCurrentPage(index) {
+        const candidate = this.context.menu?.candidates[index]
+        if (candidate) { this.pendingCommit = candidate.text; this.input = "" }
+        return !!candidate
+      }
+      commitComposition() { const text = this.input || null; this.input = ""; return { text } }
+      clearComposition() { this.input = "" }
+      close() { this.closed = true }
+    },
+  }
+}
+
 function nodes(element) {
   if (Array.isArray(element)) return element.flatMap(nodes)
   if (!element || typeof element !== "object" || !element.type) return []
+  if (typeof element.type === "function") return [element, ...nodes(element.type(element.props))]
   return [element, ...nodes(element.props.header), ...nodes(element.children), ...nodes(element.props.footer), ...Object.values(element.props.toolbar || {}).flatMap(nodes)]
 }
 
@@ -329,6 +363,58 @@ test("an unavailable click sound does not turn a successful insertion into an er
   await settle()
   assert.equal(host.inserted.length, 1)
   assert.match(label(host.root.render()), /已填入/)
+})
+
+test("Rime mode loads the installed schema, composes pinyin and inserts a chosen candidate", async () => {
+  const host = await launch("keyboard.tsx")
+  button(host.root, "中文输入").props.action()
+  await settle()
+  assert.deepEqual(host.heights, [216, 300])
+  assert.match(label(host.root.render()), /朙月拼音/)
+  button(host.root, "n").props.action()
+  button(host.root, "i").props.action()
+  assert.equal(host.marked, "ni")
+  button(host.root, "你").props.action()
+  assert.equal(host.before, "你")
+  assert.equal(host.marked, "")
+  assert.deepEqual(host.inserted, ["你"])
+  button(host.root, "快捷消息").props.action()
+  assert.equal(host.heights.at(-1), 216)
+  assert.ok(nodes(host.root.render()).some((item) => item.type === "Button" && label(item) === "无畏契约回怼"))
+})
+
+test("Rime mode explains missing schemas and keeps the quick-message mode available", async () => {
+  const host = await launch("keyboard.tsx", loadLibrary(null), createDatabase(), createFakeRimeEngine({}, []))
+  button(host.root, "中文输入").props.action()
+  await settle()
+  assert.match(label(host.root.render()), /导入并部署 Rime 方案/)
+  button(host.root, "快捷消息").props.action()
+  assert.equal(host.heights.at(-1), 216)
+  assert.ok(nodes(host.root.render()).some((item) => item.type === "Button" && label(item) === "无畏契约回怼"))
+})
+
+test("switching to quick messages commits unfinished pinyin instead of dropping it", async () => {
+  const host = await launch("keyboard.tsx")
+  button(host.root, "中文输入").props.action()
+  await settle()
+  button(host.root, "n").props.action()
+  button(host.root, "i").props.action()
+  button(host.root, "快捷消息").props.action()
+  assert.equal(host.before, "ni")
+  assert.equal(host.marked, "")
+  assert.deepEqual(host.inserted, ["ni"])
+})
+
+test("clear input also discards active Rime composition", async () => {
+  const host = await launch("keyboard.tsx")
+  host.before = "整段草稿"
+  button(host.root, "中文输入").props.action()
+  await settle()
+  button(host.root, "n").props.action()
+  assert.equal(host.marked, "n")
+  button(host.root, "清空输入").props.action()
+  assert.equal(host.before, "")
+  assert.equal(host.marked, "")
 })
 
 test("settings can add a scene-tagged multiline snippet and persist it for keyboard filtering", async () => {
